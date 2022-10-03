@@ -116,18 +116,6 @@ protected:
 	float alpha;
 };
 
-/*
-
-*/
-
-class weighted_v1 : public weight_agent {
-public:
-	weighted_v1(const std::string& args = "") : weight_agent("name=place role=placer " + args), opcode({0, 1, 2, 3}){
-	}
-
-private:
-	std::array<int, 4> opcode;
-};
 
 
 
@@ -189,4 +177,61 @@ public:
 
 private:
 	std::array<int, 4> opcode;
+};
+
+/*
+* depth = 1
+*/
+
+class random_slider_1 : public random_agent {
+public:
+	random_slider_1(const std::string& args = "") : random_agent("name=slide role=slider " + args),
+		opcode({ 0, 1, 2, 3 }) {}
+
+	action take_action(const board& before) {
+		int max_op = -1, max = -1;
+		for (int op : opcode) {
+			board::reward reward = board(before).slide(op);
+			if (reward > max){
+				max_op = op;
+				max = reward;
+			}
+		}
+		return max == -1 ? action() : action::slide(max_op);
+	}
+private:
+	std::array<int, 4> opcode;
+};
+
+
+class random_slider_2 : public random_agent {
+	public:
+	random_slider_2(const std::string& args = "") : random_agent("name=slide role=slider " + args),
+		opcode({ 0, 1, 2, 3 }) {}
+
+	action take_action(const board& before) {
+		int max_op = -1, max = -1;
+
+		for (int op : opcode) {
+			auto tmp = before;
+			board::reward outside_reward = tmp.slide(op);
+			
+			//board::reward placer_reward = placer.take_action(tmp).apply(tmp);
+
+			for (int inside_op : opcode){
+				auto inside_tmp = tmp;
+				
+				board::reward inside_reward = inside_tmp.slide(inside_op);
+				if(inside_reward + outside_reward > max){
+					max = inside_reward + outside_reward;
+					max_op = op;
+				}
+			}
+		}
+		return max_op == -1 ? action() : action::slide(max_op);
+	}
+private:
+	std::array<int, 4> opcode;
+	random_placer placer;
+
 };

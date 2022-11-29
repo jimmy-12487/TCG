@@ -1,6 +1,6 @@
 /**
- * Framework for Threes! and its variants (C++ 11)
- * agent.h: Define the behavior of variants of agents including players and environments
+ * Framework for NoGo and similar games (C++ 11)
+ * agent.h: Define the behavior of variants of the player
  *
  * Author: Theory of Computer Games
  *         Computer Games and Intelligence (CGI) Lab, NYCU, Taiwan
@@ -15,12 +15,13 @@
 #include <type_traits>
 #include <algorithm>
 #include <fstream>
-#include <vector>
-
 #include "board.h"
 #include "action.h"
-#include "weight.h"
-#include "board.h"
+
+#include <chrono>
+#include <cmath>
+#include <map>
+#include <tuple>
 
 class agent {
 public:
@@ -43,6 +44,8 @@ public:
 	virtual void notify(const std::string& msg) { meta[msg.substr(0, msg.find('='))] = { msg.substr(msg.find('=') + 1) }; }
 	virtual std::string name() const { return property("name"); }
 	virtual std::string role() const { return property("role"); }
+	virtual std::string cycle() const { return property("T"); }
+	virtual std::string exp_cons() const { return property("exp"); }
 
 protected:
 	typedef std::string key;
@@ -71,207 +74,303 @@ protected:
 };
 
 /**
- * base agent for agents with weight tables and a learning rate
+ * random player for both side
+ * put a legal piece randomly
  */
-class weight_agent : public agent {
+class player : public random_agent {
 public:
-	weight_agent(const std::string& args = "") : agent(args), alpha(0) {
-		if (meta.find("init") != meta.end())
-			init_weights(meta["init"]);
-		if (meta.find("load") != meta.end())
-			load_weights(meta["load"]);
-		if (meta.find("alpha") != meta.end())
-			alpha = float(meta["alpha"]);
-	}
-	virtual ~weight_agent() {
-		if (meta.find("save") != meta.end())
-			save_weights(meta["save"]);
-	}
-
-protected:
-	virtual void init_weights(const std::string& info) {
-		std::string res = info; // comma-separated sizes, e.g., "65536,65536"
-		for (char& ch : res)
-			if (!std::isdigit(ch)) ch = ' ';
-		std::stringstream in(res);
-		for (size_t size; in >> size; net.emplace_back(size));
-	}
-	virtual void load_weights(const std::string& path) {
-		std::ifstream in(path, std::ios::in | std::ios::binary);
-		if (!in.is_open()) std::exit(-1);
-		uint32_t size;
-		in.read(reinterpret_cast<char*>(&size), sizeof(size));
-		net.resize(size);
-		for (weight& w : net) in >> w;
-		in.close();
-	}
-	virtual void save_weights(const std::string& path) {
-		std::ofstream out(path, std::ios::out | std::ios::binary | std::ios::trunc);
-		if (!out.is_open()) std::exit(-1);
-		uint32_t size = net.size();
-		out.write(reinterpret_cast<char*>(&size), sizeof(size));
-		for (weight& w : net) out << w;
-		out.close();
+	player(const std::string& args = "") : random_agent("name=random role=unknown " + args),
+		space(board::size_x * board::size_y), who(board::empty) {
+		if (name().find_first_of("[]():; ") != std::string::npos)
+			throw std::invalid_argument("invalid name: " + name());
+		if (role() == "black"){
+			who = board::black;
+			printf("black using random \n\n");
+		}
+		if (role() == "white"){
+			who = board::white;
+			printf("white using random \n\n");
+		}
+		if (who == board::empty)
+			throw std::invalid_argument("invalid role: " + role());
+		for (size_t i = 0; i < space.size(); i++)
+			space[i] = action::place(i, who);
 	}
 
-protected:
-	std::vector<weight> net;
-	float alpha;
-};
-
-
-
-
-/**
- * default random environment, i.e., placer
- * place the hint tile and decide a new hint tile
- */
-class random_placer : public random_agent {
-public:
-	random_placer(const std::string& args = "") : random_agent("name=slide role=slider " + args) {
-		spaces[0] = { 12, 13, 14, 15 };
-		spaces[1] = { 0, 4, 8, 12 };
-		spaces[2] = { 0, 1, 2, 3};
-		spaces[3] = { 3, 7, 11, 15 };
-		spaces[4] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-	}
-
-	virtual action take_action(const board& after) {
-		std::vector<int> space = spaces[after.last()];
+	virtual action take_action(const board& state) {
 		std::shuffle(space.begin(), space.end(), engine);
-		for (int pos : space) {
-			if (after(pos) != 0) continue;
-
-			int bag[3], num = 0;
-			for (board::cell t = 1; t <= 3; t++)
-				for (size_t i = 0; i < after.bag(t); i++)
-					bag[num++] = t;
-			std::shuffle(bag, bag + num, engine);
-
-			board::cell tile = after.hint() ?: bag[--num];
-			board::cell hint = bag[--num];
-
-			return action::place(pos, tile, hint);
+		for (const action::place& move : space) {
+			board after = state;
+			if (move.apply(after) == board::legal)
+				return move;
 		}
 		return action();
 	}
 
 private:
-	std::vector<int> spaces[5];
+	std::vector<action::place> space;
+	board::piece_type who;
 };
 
-/**
- * random player, i.e., slider
- * select a legal action randomly
- */
-class random_slider : public random_agent {
+class MCTS_player : public random_agent {
 public:
-	random_slider(const std::string& args = "") : random_agent("name=slide role=slider " + args),
-		opcode({ 0, 1, 2, 3 }) {}
+	MCTS_player(const std::string& args = "") : random_agent("name=mcts role=unknown " + args),
+		space_size(board::size_x * board::size_y), who(-1) {
+		if (name().find_first_of("[]():; ") != std::string::npos)
+			throw std::invalid_argument("invalid name: " + name());
+		try {
+			cycles = std::stoi(cycle());
+		} catch(std::exception &e) {}
+		try{
+			exploration_constant = std::stod(exp_cons());
+		} catch(std::exception &e) {}
 
-	virtual action take_action(const board& before) {
-		std::shuffle(opcode.begin(), opcode.end(), engine);
-		for (int op : opcode) {
-			board::reward reward = board(before).slide(op);
-			if (reward != -1) return action::slide(op);
+		if (role() == "black"){
+			who = 1;
+			printf("black using mcts with cycles(%d) exp(%.2f)\n\n", cycles, exploration_constant);
 		}
-		return action();
+		else if (role() == "white"){
+			who = 0;
+			printf("white using mcts with cycles(%d) exp(%.2f)\n\n", cycles, exploration_constant);
+		}
+		if (who == (size_t) -1) throw std::invalid_argument("invalid role: " + role());
+		
 	}
 
-private:
-	std::array<int, 4> opcode;
-};
+	virtual action take_action(const board& state) {
+		board b = board(state);
+		// std::cerr << b;
+		Node root(engine, b, 1-who, space_size);
+		// printf("root move_size: %d\n", root.moves_.size());
 
-/*
-
-	N-TUPLE
-
-*/
-
-class tuple_agent : public weight_agent{
-public:
-	tuple_agent(const std::string& args = "") : weight_agent("name=slide role=slider" + args) {
-		prev = NULL; 
-		current = NULL;
-	}
-
-	void put_board(board* b){
-		if(prev == NULL)	prev = b;
-		else{
-			prev = current;
-			current = b;
+		constexpr const double threshold_time = 1.;
+		const auto start_time = std::chrono::high_resolution_clock::now();
+    double dt;
+		int itr = 0;
+		do {
+			Node *node = &root;
+			board b = board(state);
+			// std::array<board::board_t, 2> rave;
 			
-			update();	
-		}
-	}
+      // selection
+			while (!node->has_untried_moves() && node->has_children()) {
+        node = node->get_UCT_child();
+				auto &&[bw, pos] = node->get_move();
+				action::place move = action::place(pos, (bw==1) ? board::black : board::white);
+				move.apply(b);
+				// rave[bw].set(pos);
+      }
+      // expansion
+      if (node->has_untried_moves()) {
+				auto &&[bw, pos] = node->pop_untried_move();
+        action::place move = action::place(pos, (bw==1) ? board::black : board::white);
+        move.apply(b);
+				// rave[bw].set(pos);
+				// std::cerr << b;
+        node = node->add_child(engine, b, bw, pos);
+				// printf("node move_size: %d\n", node->moves_.size());
+      }
+      // simulation & rollout
+			size_t bw = 1 - node->get_player();
+			while (true) {
+				std::vector<size_t> moves;
+				for (size_t i = 0; i < board::size_x * board::size_y ; i++){
+					action::place m = action::place(i, (bw==1) ? board::black : board::white);
+					board tmp = board(b);
+					if (m.apply(tmp) == board::legal) {
+						moves.push_back(i);
+					}
+				}
+				if (moves.empty()) break;
 
-	void update(){
-		float prev_score = prev->value(); 
+				std::uniform_int_distribution<size_t> choose(0, moves.size() - 1);
+				auto it = moves.begin() + choose(engine);
+				size_t pos = *it;
+				moves.erase(it);
+
+				action::place move = action::place(pos, (bw==1) ? board::black : board::white);
+				move.apply(b);
+				// if (is_two_go) {
+				// rave[bw].set(pos);
+					// }
+				// std::cerr << b;
+				bw = 1 - bw;
+			};
+			// size_t winner = playout(b, 1-node->get_player(), rave);
+			size_t winner =  1 - bw;
+
+      // backpropogation
+      while (node != nullptr) {
+        // node->update(winner == node->get_player(), rave);
+				node->update(winner == node->get_player());
+        node = node->get_parent();
+      }
+			// time threshold
+			dt = 1e-9 * std::chrono::duration_cast<std::chrono::nanoseconds>(
+										std::chrono::high_resolution_clock::now() - start_time
+									).count();
+			// iteration threshold
+			itr++;
+		} while (dt < threshold_time && itr<=cycles);
 		
-		std::cout << "GET ALL VALUE\n";
-		float current_score = current->value();
-		float prev_value = 0, current_value = 0;
-		for(int i = 0; i < 4; i++){
-			prev_value += net[i][index_to_index((*prev)[0][i], (*prev)[1][i], (*prev)[2][i], (*prev)[3][i])];
-			current_value += net[i][index_to_index((*current)[0][i], (*current)[1][i], (*current)[2][i], (*current)[3][i])];
-		}
-		std::cout << "GET ALL VALUE\n";
-		for(int i = 0; i < 4; i++){
-			prev_value += net[i][index_to_index((*prev)[i][0], (*prev)[i][1], (*prev)[i][2], (*prev)[i][3])];
-			current_value += net[i][index_to_index((*current)[i][0], (*current)[i][1], (*current)[i][2], (*current)[i][3])];
-		}
-		
-		for(int i = 0; i < 4; i++){
-			unsigned long long prev_index = index_to_index((*prev)[0][i], (*prev)[1][i], (*prev)[2][i], (*prev)[3][i]);
-			net[i][prev_index] = net[i][prev_index] + alpha * ( (current_score - prev_score) +  current_value - prev_value);
-		}
-		for(int i = 0; i < 4; i++){
-			unsigned long long prev_index = index_to_index((*prev)[i][0], (*prev)[i][1], (*prev)[i][2], (*prev)[i][3]);
-			net[i + 4][prev_index] = net[i + 4][prev_index] + alpha * ( (current_score - prev_score) +  current_value - prev_value);
-		}
+		std::vector<Node> &children = root.get_children();
+		if(children.empty()) return action();
+
+		std::map<size_t, float> move_ratio;
+		for (const auto &child : children) {
+      auto &&[wins, visits] = child.get_wins_visits();
+			auto &&[bw, pos] = child.get_move();
+			// float ratio = (float) wins / (float) visits;
+			float ratio = (float) visits;
+      move_ratio.emplace(pos, ratio);
+			// printf("move(%d) ratio(%.1f=%d/%d) \n",pos,ratio,wins,visits);
+    }
+		size_t best_move = std::max_element(std::begin(move_ratio), std::end(move_ratio),
+                                        [](const std::pair<size_t, float> p1, const std::pair<size_t, float> p2) {
+                                          return p1.second < p2.second;
+                                        })
+                           ->first;
+    return action::place(best_move, (who==1) ? board::black : board::white);
 	}
 
-	void last_update(){
-		float prev_value = 0;
-		for(int i = 0; i < 4; i++) prev_value += net[i][index_to_index((*prev)[0][i], (*prev)[1][i], (*prev)[2][i], (*prev)[3][i])];
-		for(int i = 4; i < 8; i++) prev_value += net[i][index_to_index((*prev)[i][0], (*prev)[i][1], (*prev)[i][2], (*prev)[i][3])];
+private:
+	std::vector<action::place> legal_moves;
+	size_t space_size;
+	size_t who;
+	int cycles = 1000;
+	double exploration_constant=0.25;
 
-		for(int i = 0; i < 4; i++){
-			unsigned long long prev_index = index_to_index((*prev)[0][i], (*prev)[1][i], (*prev)[2][i], (*prev)[3][i]);
-			net[i][prev_index] = net[i][prev_index] + alpha * ( 0 - prev_value);
-		}
-		for(int i = 4; i < 8; i++){
-			unsigned long long prev_index = index_to_index((*prev)[i][0], (*prev)[i][1], (*prev)[i][2], (*prev)[i][3]);
-			net[i][prev_index] = net[i][prev_index] + alpha * ( 0 - prev_value);
-		}
-	}
+	// size_t playout(board b, size_t bw, const std::array<board::board_t, 2> &rave) {
+	// 	// const auto init_two_go = board.get_two_go();
+	// 	// bool is_two_go;
+  //   while (true) {
+	// 		std::vector<size_t> moves;
+	// 		for (size_t i = 0; i < board::size_x * board::size_y ; i++){
+	// 			action::place m = action::place(i, (bw==1) ? board::black : board::white);
+	// 			board tmp = board(b);
+	// 			if (m.apply(tmp) == board::legal) {
+	// 				moves.push_back(i);
+	// 			}
+	// 		}
+  //     if (moves.empty()) break;
 
-	unsigned long index_to_index(int index0, int index1, int index2, int index3){
-		return index0*4096 + index1 * 256 + index2 * 16 + index3;
-	}
+  //     std::uniform_int_distribution<size_t> choose(0, moves.size() - 1);
+  //     auto it = moves.begin() + choose(engine);
+  //     size_t pos = *it;
+  //     moves.erase(it);
 
-	action take_action(const board& before){
-		float max_gain = 0;
-		int max_move = -1;
+	// 		action::place move = action::place(pos, (bw==1) ? board::black : board::white);
+	// 		move.apply(b);
+	// 		// if (is_two_go) {
+	// 		rave[bw].set(pos);
+  //       // }
+	// 		// std::cerr << b;
+  //     bw = 1 - bw;
+  //   };
+  //   return 1-bw;
+  // }
 
-		for(int i = 0; i < 4; i++){
-			float current_value = 0;
-			for(int j = 0; j < 4; j++) current_value += net[j][index_to_index((*current)[0][j], (*current)[1][j], (*current)[2][j], (*current)[3][j])];
-			for(int j = 0; j < 4; j++) current_value += net[i][index_to_index((*current)[j][0], (*current)[j][1], (*current)[j][2], (*current)[j][3])];
-			board::reward reward = board(before).slide(i);
-			if(reward == -1) continue;
-			else{
-				if(current_value + reward > max_gain){
-					max_gain = current_value + reward;
-					max_move = i;
+	class Node {
+	public:	
+		// Node() = default;
+		Node(std::default_random_engine engine, board &b, 
+				size_t who, size_t pos = board::size_x * board::size_y, Node *parent = nullptr){
+			engine_ = engine;
+			bw_ = who;
+			pos_ = pos;
+			parent_ = parent;
+			// list all move that opponent can place
+			size_t bw = 1-who;
+			for (size_t i = 0; i < board::size_x * board::size_y ; i++){
+				action::place m = action::place(i, (bw==1) ? board::black : board::white);
+				board tmp = board(b);
+				if (m.apply(tmp) == board::legal) {
+					moves_.push_back(i);
+					// if(parent==nullptr){
+					// 	printf("pushing %d\n",i);
+					// 	std::cerr << tmp;
+					// }
 				}
 			}
 		}
+		// Node(const Node &) = default;
+		// Node(Node &&) noexcept = default;
+		// Node &operator=(const Node &) = default;
+		// Node &operator=(Node &&) noexcept = default;
+		~Node() = default;
 
+	public:
+		Node *get_parent() const { return parent_; };
+		size_t get_player() const { return bw_; }
+		std::vector<Node> &get_children() { return children_;	}
 
-		return max_move == -1 ? action() : action::slide(max_move);
-	}
+		std::tuple<size_t, size_t> get_wins_visits() const { return std::make_tuple(wins_, visits_); }
 
-private:
-	board *prev, *current;
+		std::tuple<size_t, size_t> get_move() const { return std::make_tuple(bw_, pos_); }
+
+		Node *get_UCT_child() {
+			for (auto &child : children_) {
+				child.uct_score_ =
+						double(child.wins_) / double(child.visits_) +
+						std::sqrt(/*2.0 * */std::log(double(visits_)) / child.visits_)*exploration_constant;
+				
+				// rave
+				// child.uct_score_ = (child.rave_wins_ + child.wins_ + std::sqrt(std::log(double(visits_)) * child.visits_) * exploration_constant) /
+        //                     (child.rave_visits_ + child.visits_);
+			}
+			return &*std::max_element(children_.begin(), children_.end(),
+																[](const Node &lhs, const Node &rhs) {
+																	return lhs.uct_score_ < rhs.uct_score_;
+																});
+		}
+
+		bool has_untried_moves() const { return !moves_.empty(); }
+		bool has_children() const { return !children_.empty(); }
+
+		std::tuple<size_t, size_t> pop_untried_move() {
+			std::uniform_int_distribution<size_t> choose(0, moves_.size() - 1);
+			auto it = moves_.begin() + choose(engine_);
+			size_t pos = *it;
+			moves_.erase(it);
+			return std::make_tuple(1-bw_, pos);
+		}
+		
+		
+		Node *add_child(std::default_random_engine engine, board &b,
+				size_t who, size_t pos = board::size_x * board::size_y) {
+			Node node(engine, b, who, pos, this);
+			children_.emplace_back(node);
+			return &children_.back();
+		}
+		// void update(bool win, const std::array<board::board_t, 2> &rave) {
+		void update(bool win){
+			++visits_;
+			wins_ += win ? 1 : 0;
+
+			// rave
+			// const size_t csize = children_.size(),
+      //              cwin = win ? 0 : 1;
+      // const auto &rave_ = rave[1 - bw_];
+      // for (size_t i = 0; i < csize; ++i) {
+      //   auto &child = children_[i];
+
+      //   if (rave_.BIT_TEST(child.pos_)) {
+      //     ++child.rave_visits_;
+      //     child.rave_wins_ += cwin;
+      //   }
+      // }
+		}
+
+	private:
+	public:
+		std::default_random_engine engine_;
+		std::vector<Node> children_;
+		std::vector<size_t> moves_;
+		size_t bw_;
+		size_t pos_;
+		Node *parent_;
+		double exploration_constant = 0.25;
+		size_t visits_ = 0, wins_ = 0, rave_wins_ = 0, rave_visits_ = 0;;
+		double uct_score_;
+	};
 };
